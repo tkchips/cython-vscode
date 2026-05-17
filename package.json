@@ -1,23 +1,70 @@
 {
   "name": "cython-vscode",
   "displayName": "cython-vscode",
-  "description": "",
+  "description": "Cython semantic highlighting powered by tree-sitter-cython",
   "version": "0.0.1",
   "engines": {
-    "vscode": "^1.120.0"
+    "vscode": "^1.119.0"
   },
   "categories": [
-    "Other"
+    "Programming Languages"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:cython",
+    "onCommand:cython-vscode.refreshParse",
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "cython-vscode.helloWorld",
-        "title": "Hello World"
+        "command": "cython-vscode.refreshParse",
+        "title": "Cython: Refresh Parse"
+      },
+      {
+        "command": "cython-vscode.showLog",
+        "title": "Cython: Show Extension Log"
       }
-    ]
+    ],
+    "languages": [
+      {
+        "id": "cython",
+        "aliases": [
+          "Cython",
+          "cython"
+        ],
+        "extensions": [
+          ".pyx",
+          ".pxd",
+          ".pxi"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "cython-vscode",
+      "properties": {
+        "cython-vscode.treeSitterCythonRoot": {
+          "type": "string",
+          "default": "/home/tkc/workspace/tree-sitter-cython",
+          "description": "Absolute path to the tree-sitter-cython repository root used for parser and highlights query."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[cython]": {
+        "editor.semanticHighlighting.enabled": true
+      }
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "cython-vscode.refreshParse",
+          "when": "editorTextFocus && resourceLangId == cython",
+          "group": "navigation@99"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -28,8 +75,9 @@
     "test": "vscode-test"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/mocha": "^10.0.10",
-    "@types/node": "22.x",
+    "@types/node": "^22.19.19",
     "@types/vscode": "^1.120.0",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
