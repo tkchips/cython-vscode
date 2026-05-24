@@ -48,6 +48,11 @@
           "type": "string",
           "default": "/home/tkc/workspace/tree-sitter-cython",
           "description": "Absolute path to the tree-sitter-cython repository root used for parser and highlights query."
+        },
+        "cython-vscode.enableHoverDebug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show tree-sitter parse node info on hover (debug feature)."
         }
       }
     },

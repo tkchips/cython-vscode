@@ -148,6 +148,10 @@ class CythonSemanticTokensProvider implements vscode.DocumentSemanticTokensProvi
 		return builder.build();
 	}
 
+	public getRuntime(): Runtime | undefined {
+		return this.getOrCreateRuntime();
+	}
+
 	public refresh(reason: string): void {
 		this.logger.info(`Manual parse refresh requested (${reason})`);
 		this.runtime = undefined;
@@ -283,6 +287,128 @@ function compareSegments(a: TokenSegment, b: TokenSegment): number {
 		return a.start - b.start;
 	}
 	return a.end - b.end;
+}
+
+class CythonHoverProvider implements vscode.HoverProvider {
+	public constructor(
+		private readonly tokensProvider: CythonSemanticTokensProvider,
+		private readonly logger: Logger,
+	) {}
+
+	public provideHover(
+		document: vscode.TextDocument,
+		position: vscode.Position,
+		t: vscode.CancellationToken,
+	): vscode.ProviderResult<vscode.Hover> {
+		const config = vscode.workspace.getConfiguration('cython-vscode');
+		if (!config.get<boolean>('enableHoverDebug', false)) {
+			return null;
+		}
+
+		const runtime = this.tokensProvider.getRuntime();
+		if (!runtime) {
+			return null;
+		}
+
+		if (t.isCancellationRequested) {
+			return null;
+		}
+
+		const tree = runtime.parser.parse(document.getText());
+		const node = tree.rootNode.descendantForPosition({
+			row: position.line,
+			column: position.character,
+		});
+		if (!node) {
+			return null;
+		}
+
+		const captures = runtime.query.captures(tree.rootNode);
+		const matchingCaptures = captures
+			.filter((c) => isPositionInNodeRange(position, c.node))
+			.sort((a, b) => {
+				const sizeA = a.node.endIndex - a.node.startIndex;
+				const sizeB = b.node.endIndex - b.node.startIndex;
+				return sizeA - sizeB;
+			});
+
+		const lines: string[] = [];
+
+		if (tree.rootNode.hasError) {
+			lines.push('### ⚠ tree-sitter debug (parse error detected)');
+		} else {
+			lines.push('### tree-sitter debug');
+		}
+
+		lines.push('');
+		lines.push('**node**');
+		lines.push(`\`${node.type}\``);
+		const isNamed = node.isNamed;
+		const nameLabel = isNamed ? 'named' : 'unnamed';
+		lines.push(
+			`${nameLabel}  ·  L${node.startPosition.row}:${node.startPosition.column} – L${node.endPosition.row}:${node.endPosition.column}  ·  ${node.endIndex - node.startIndex} bytes`,
+		);
+		lines.push('');
+
+		const textSnippet = truncateForLog(normalizeWhitespace(node.text), 200);
+		if (textSnippet.length > 0) {
+			lines.push(`**text**: \`${textSnippet}\``);
+			lines.push('');
+		}
+
+		if (matchingCaptures.length > 0) {
+			lines.push('**highlight captures**:');
+			for (const c of matchingCaptures) {
+				const spec = resolveTokenSpec(c.name);
+				const tokenInfo = spec ? `${spec.type}` : 'unmapped';
+				lines.push(`- \`@${c.name}\` → ${tokenInfo}`);
+			}
+			lines.push('');
+		} else {
+			lines.push('*(no highlight captures cover this position)*');
+			lines.push('');
+		}
+
+		const namedChildren = node.namedChildren;
+		if (namedChildren.length > 0) {
+			lines.push(`**named children** (${namedChildren.length}):`);
+			for (const child of namedChildren) {
+				lines.push(
+					`- \`${child.type}\`  L${child.startPosition.row}:${child.startPosition.column}–L${child.endPosition.row}:${child.endPosition.column}`,
+				);
+			}
+			lines.push('');
+		}
+
+		const ancestors: string[] = [];
+		let cursor = node.parent;
+		while (cursor) {
+			ancestors.push(
+				`\`${cursor.type}\` L${cursor.startPosition.row}:${cursor.startPosition.column}`,
+			);
+			cursor = cursor.parent;
+		}
+		if (ancestors.length > 0) {
+			lines.push(`**ancestors**: ${ancestors.join(' → ')}`);
+		}
+
+		return new vscode.Hover(new vscode.MarkdownString(lines.join('\n')));
+	}
+}
+
+function isPositionInNodeRange(position: vscode.Position, node: Parser.SyntaxNode): boolean {
+	const start = node.startPosition;
+	const end = node.endPosition;
+	if (position.line < start.row || position.line > end.row) {
+		return false;
+	}
+	if (position.line === start.row && position.character < start.column) {
+		return false;
+	}
+	if (position.line === end.row && position.character > end.column) {
+		return false;
+	}
+	return true;
 }
 
 function logTreeSitterOutput(
@@ -485,6 +611,9 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(provider);
 	context.subscriptions.push(
 		vscode.languages.registerDocumentSemanticTokensProvider(selector, provider, LEGEND),
+	);
+	context.subscriptions.push(
+		vscode.languages.registerHoverProvider(selector, new CythonHoverProvider(provider, logger)),
 	);
 	context.subscriptions.push(
 		vscode.commands.registerCommand(REFRESH_PARSE_COMMAND, () => {
