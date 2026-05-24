@@ -8,6 +8,10 @@ const QUERY_RELATIVE_PATH = path.join('queries', 'highlights.scm');
 const REFRESH_PARSE_COMMAND = 'cython-vscode.refreshParse';
 const SHOW_LOG_COMMAND = 'cython-vscode.showLog';
 const OUTPUT_CHANNEL_NAME = 'cython-vscode';
+const MAX_AST_LOG_CHARS = 8000;
+const MAX_CAPTURE_LOG_ITEMS = 120;
+const MAX_CAPTURE_TEXT_CHARS = 120;
+const QUERY_CAPTURE_PATTERN = /@([A-Za-z0-9_.-]+)/g;
 
 const TOKEN_TYPES = [
 	'class',
@@ -47,6 +51,12 @@ type Runtime = {
 	root: string;
 	parser: Parser;
 	query: Parser.Query;
+	querySource: string;
+};
+
+type CompatibleQueryBuild = {
+	query: Parser.Query;
+	compiledSource: string;
 };
 
 type Logger = {
@@ -61,6 +71,7 @@ const CAPTURE_TOKEN_MAP = new Map<string, TokenSpec>([
 	['number', { type: 'number', priority: 110 }],
 	['keyword', { type: 'keyword', priority: 110 }],
 	['operator', { type: 'operator', priority: 105 }],
+	['type.builtin', { type: 'type', modifiers: ['defaultLibrary'], priority: 100 }],
 	['function.builtin', { type: 'function', modifiers: ['defaultLibrary'], priority: 100 }],
 	['function.method', { type: 'method', priority: 95 }],
 	['function', { type: 'function', priority: 90 }],
@@ -96,6 +107,7 @@ class CythonSemanticTokensProvider implements vscode.DocumentSemanticTokensProvi
 
 		const tree = runtime.parser.parse(document.getText());
 		const captures = runtime.query.captures(tree.rootNode);
+		logTreeSitterOutput(this.logger, document, tree, captures);
 		const segmentByRange = new Map<string, TokenSegment>();
 
 		for (const capture of captures) {
@@ -165,12 +177,15 @@ class CythonSemanticTokensProvider implements vscode.DocumentSemanticTokensProvi
 			const parser = new Parser();
 			parser.setLanguage(language);
 
+			const builtQuery = buildCompatibleHighlightsQuery(language, querySource, this.logger);
 			this.runtime = {
 				root: configuredRoot,
 				parser,
-				query: new Parser.Query(language, querySource),
+				query: builtQuery.query,
+				querySource: builtQuery.compiledSource,
 			};
 			this.logger.info(`Loaded tree-sitter-cython runtime from ${configuredRoot}`);
+			logCaptureMappingCoverage(this.logger, this.runtime.querySource);
 			return this.runtime;
 		} catch (error) {
 			this.runtimeLoadError = error instanceof Error ? error.message : String(error);
@@ -213,16 +228,19 @@ function loadTreeSitterLanguage(root: string): Parser.Language {
 }
 
 function resolveTokenSpec(captureName: string): TokenSpec | undefined {
-	const direct = CAPTURE_TOKEN_MAP.get(captureName);
-	if (direct) {
-		return direct;
+	let candidate = captureName;
+	while (candidate.length > 0) {
+		const direct = CAPTURE_TOKEN_MAP.get(candidate);
+		if (direct) {
+			return direct;
+		}
+		const dotIndex = candidate.lastIndexOf('.');
+		if (dotIndex < 0) {
+			break;
+		}
+		candidate = candidate.slice(0, dotIndex);
 	}
-
-	const [prefix] = captureName.split('.', 1);
-	if (!prefix) {
-		return undefined;
-	}
-	return CAPTURE_TOKEN_MAP.get(prefix);
+	return undefined;
 }
 
 function buildTokenSegments(document: vscode.TextDocument, node: Parser.SyntaxNode, spec: TokenSpec): TokenSegment[] {
@@ -265,6 +283,196 @@ function compareSegments(a: TokenSegment, b: TokenSegment): number {
 		return a.start - b.start;
 	}
 	return a.end - b.end;
+}
+
+function logTreeSitterOutput(
+	logger: Logger,
+	document: vscode.TextDocument,
+	tree: Parser.Tree,
+	captures: Parser.QueryCapture[],
+): void {
+	const ast = truncateForLog(tree.rootNode.toString(), MAX_AST_LOG_CHARS);
+	logger.info(`tree-sitter root: type=${tree.rootNode.type} hasError=${tree.rootNode.hasError}`);
+	logger.info(`tree-sitter ast(${document.uri.fsPath}): ${ast}`);
+
+	const showCount = Math.min(captures.length, MAX_CAPTURE_LOG_ITEMS);
+	logger.info(
+		`tree-sitter captures(${document.uri.fsPath}): total=${captures.length}, showing=${showCount}`,
+	);
+
+	for (let i = 0; i < showCount; i += 1) {
+		const capture = captures[i];
+		const snippet = truncateForLog(normalizeWhitespace(capture.node.text), MAX_CAPTURE_TEXT_CHARS);
+		const start = capture.node.startPosition;
+		const end = capture.node.endPosition;
+		logger.info(
+			`capture[${i + 1}] name=${capture.name} range=${start.row}:${start.column}-${end.row}:${end.column} text="${snippet}"`,
+		);
+	}
+
+	if (captures.length > showCount) {
+		logger.info(`... ${captures.length - showCount} captures omitted from log`);
+	}
+}
+
+function normalizeWhitespace(value: string): string {
+	return value.replace(/\s+/g, ' ').trim();
+}
+
+function truncateForLog(value: string, maxChars: number): string {
+	if (value.length <= maxChars) {
+		return value;
+	}
+	return `${value.slice(0, maxChars)}... [truncated ${value.length - maxChars} chars]`;
+}
+
+function buildCompatibleHighlightsQuery(
+	language: Parser.Language,
+	querySource: string,
+	logger: Logger,
+): CompatibleQueryBuild {
+	let workingSource = querySource;
+	let droppedPatternCount = 0;
+
+	for (let attempt = 0; attempt < 512; attempt += 1) {
+		try {
+			const query = new Parser.Query(language, workingSource);
+			if (droppedPatternCount > 0) {
+				logger.warn(
+					`Compiled highlights query after dropping ${droppedPatternCount} incompatible pattern(s).`,
+				);
+			}
+			return {
+				query,
+				compiledSource: workingSource,
+			};
+		} catch (error) {
+			const errorMessage = error instanceof Error ? error.message : String(error);
+			const errorPosition = parseQueryErrorPosition(errorMessage);
+			if (!errorMessage.includes('TSQueryErrorNodeType') || errorPosition === undefined) {
+				throw error;
+			}
+
+			const range = findTopLevelPatternRange(workingSource, errorPosition);
+			if (!range) {
+				throw error;
+			}
+
+			const snippet = truncateForLog(normalizeWhitespace(workingSource.slice(range.start, range.end)), 220);
+			logger.warn(
+				`Dropping incompatible query pattern at byte ${errorPosition}: ${snippet}`,
+			);
+
+			workingSource = `${workingSource.slice(0, range.start)}\n${workingSource.slice(range.end)}`;
+			droppedPatternCount += 1;
+		}
+	}
+
+	throw new Error('Could not compile highlights query after dropping many incompatible patterns.');
+}
+
+function parseQueryErrorPosition(errorMessage: string): number | undefined {
+	const match = /position\s+(\d+)/i.exec(errorMessage);
+	if (!match) {
+		return undefined;
+	}
+	const parsed = Number(match[1]);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function findTopLevelPatternRange(
+	source: string,
+	position: number,
+): { start: number; end: number } | undefined {
+	const target = Math.min(Math.max(position, 0), Math.max(source.length - 1, 0));
+	let inString = false;
+	let escaped = false;
+	let inComment = false;
+	let depth = 0;
+	let currentTopLevelStart = -1;
+
+	for (let i = 0; i < source.length; i += 1) {
+		const ch = source[i];
+
+		if (inComment) {
+			if (ch === '\n') {
+				inComment = false;
+			}
+			continue;
+		}
+
+		if (inString) {
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (ch === '\\') {
+				escaped = true;
+				continue;
+			}
+			if (ch === '"') {
+				inString = false;
+			}
+			continue;
+		}
+
+		if (ch === ';') {
+			inComment = true;
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+			continue;
+		}
+		if (ch === '(') {
+			if (depth === 0) {
+				currentTopLevelStart = i;
+			}
+			depth += 1;
+			continue;
+		}
+		if (ch === ')') {
+			if (depth <= 0) {
+				continue;
+			}
+			depth -= 1;
+			if (depth === 0 && currentTopLevelStart >= 0) {
+				const topLevelEnd = i + 1;
+				if (target >= currentTopLevelStart && target < topLevelEnd) {
+					return { start: currentTopLevelStart, end: topLevelEnd };
+				}
+				currentTopLevelStart = -1;
+			}
+		}
+	}
+
+	return undefined;
+}
+
+function logCaptureMappingCoverage(logger: Logger, querySource: string): void {
+	const captureNames = extractQueryCaptureNames(querySource);
+	const unmapped = captureNames.filter((captureName) => !resolveTokenSpec(captureName));
+	logger.info(
+		`query capture coverage: mapped=${captureNames.length - unmapped.length}/${captureNames.length} captures`,
+	);
+	logger.info(`query captures: ${captureNames.join(', ')}`);
+	if (unmapped.length > 0) {
+		logger.warn(`unmapped query captures: ${unmapped.join(', ')}`);
+	}
+}
+
+function extractQueryCaptureNames(querySource: string): string[] {
+	const captures = new Set<string>();
+	let match = QUERY_CAPTURE_PATTERN.exec(querySource);
+	while (match) {
+		const captureName = match[1];
+		if (captureName) {
+			captures.add(captureName);
+		}
+		match = QUERY_CAPTURE_PATTERN.exec(querySource);
+	}
+	QUERY_CAPTURE_PATTERN.lastIndex = 0;
+	return [...captures].sort();
 }
 
 export function activate(context: vscode.ExtensionContext): void {
